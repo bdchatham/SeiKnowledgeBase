@@ -1,38 +1,34 @@
-# Sei Architecture Atlas
+# Archon — Sei Architecture Reference
 
 Dense cross-cutting reference synthesized from 12 research memories. Read this first for architectural context -- drill into specific memories for implementation detail.
 
 ## System Map
 
-```
-                         Kubernetes Cluster
-  +---------------------------------------------------------------+
-  | sei-k8s-controller (operator)                                 |
-  |   SeiNodeGroup controller  <-->  SeiNode controller           |
-  |     |                               |                         |
-  |     | owns                          | owns                    |
-  |     v                               v                         |
-  |   SeiNodeGroup CRD              SeiNode CRD                  |
-  |   (fleet, genesis,              (lifecycle, plan,             |
-  |    deployments,                  StatefulSet, PVC,            |
-  |    networking)                   headless Service)            |
-  |                                     |                         |
-  |                           HTTP :7777 (task API)               |
-  |                                     v                         |
-  |   +--Pod----------------------------------------------------+ |
-  |   | seictl sidecar          |  seid (node binary)           | |
-  |   | (init container,        |  (main container,             | |
-  |   |  restartable)           |  waits for sidecar healthz)   | |
-  |   |                         |                               | |
-  |   | sei-config library      |  sei-tendermint (consensus)   | |
-  |   | ConfigIntent -> TOML    |  sei-cosmos (app framework)   | |
-  |   |                         |  sei-chain (Sei modules)      | |
-  |   |                         |  sei-db (SeiDB storage)       | |
-  |   |                         |  go-ethereum fork (EVM)       | |
-  |   +---------------------------------------------------------+ |
-  +---------------------------------------------------------------+
-                        |
-                  AWS S3 (snapshots, genesis artifacts, result exports)
+```mermaid
+graph TD
+    subgraph Kubernetes Cluster
+        subgraph Operator
+            ctrl["sei-k8s-controller"]
+            grpCtrl["SeiNodeGroup controller"]
+            nodeCtrl["SeiNode controller"]
+            ctrl --- grpCtrl
+            ctrl --- nodeCtrl
+        end
+
+        grpCtrl -->|owns| SNG["SeiNodeGroup CRD<br/><i>fleet, genesis, deployments, networking</i>"]
+        nodeCtrl -->|owns| SN["SeiNode CRD<br/><i>lifecycle, plan, StatefulSet, PVC, Service</i>"]
+        grpCtrl -->|creates| SN
+
+        nodeCtrl -->|"HTTP :7777<br/>task API"| sidecar
+
+        subgraph Pod
+            sidecar["seictl sidecar<br/><i>sei-config library<br/>ConfigIntent → TOML</i>"]
+            seid["seid<br/><i>sei-tendermint · sei-cosmos<br/>sei-chain · sei-db<br/>go-ethereum fork</i>"]
+            sidecar -.->|"writes config.toml<br/>+ app.toml"| seid
+        end
+    end
+
+    Pod -->|"snapshots, genesis<br/>artifacts, exports"| S3["AWS S3"]
 ```
 
 **Control flow:** Controller creates CRDs -> reconciles plans -> submits tasks to sidecar -> sidecar writes config/genesis -> seid reads TOML files via Viper -> node runs.
@@ -41,35 +37,33 @@ Dense cross-cutting reference synthesized from 12 research memories. Read this f
 
 ## Configuration Pipeline
 
-```
-Controller CRD (spec.overrides)
-   |
-   v
-ConfigIntent{Mode, Overrides}  -- constructed by controller, validated with ValidateIntent()
-   |
-   v  (submitted as config-apply task)
-seictl sidecar
-   |
-   +-- ResolveIntent() / ResolveIncrementalIntent()  (sei-config library)
-   |     1. DefaultForMode(mode)  -- mode-aware defaults
-   |     2. ApplyOverrides(cfg, overrides)  -- dotted TOML key paths
-   |     3. ValidateWithOpts(cfg)  -- diagnostics
-   |     4. ResolveEnv(cfg)  -- SEI_* env var overlay
-   |
-   +-- WriteConfigToDir()
-         |
-         +-- toLegacyTendermint() -> config.toml  (hyphen keys: persistent-peers)
-         +-- toLegacyApp()        -> app.toml     (mixed keys: pruning, http_enabled)
+```mermaid
+flowchart TD
+    CRD["Controller CRD<br/><code>spec.overrides</code>"]
+    CI["ConfigIntent{Mode, Overrides}<br/><i>validated with ValidateIntent()</i>"]
+    SC["seictl sidecar<br/><i>config-apply task</i>"]
+    RI["ResolveIntent()<br/>1. DefaultForMode(mode)<br/>2. ApplyOverrides(dotted keys)<br/>3. ValidateWithOpts()<br/>4. ResolveEnv(SEI_*)"]
+    WR["WriteConfigToDir()"]
+    CT["config.toml<br/><i>hyphen keys: persistent-peers</i>"]
+    AT["app.toml<br/><i>mixed: pruning, http_enabled</i>"]
+
+    CRD --> CI --> SC --> RI --> WR
+    WR -->|toLegacyTendermint| CT
+    WR -->|toLegacyApp| AT
 ```
 
-```
-seid startup (reads these files)
-   |
-   +-- Viper ReadInConfig(config.toml)  -- Tendermint config
-   +-- Viper MergeInConfig(app.toml)   -- app config into SAME Viper instance
-   +-- AutomaticEnv("seid")            -- SEID_* env overrides at runtime
-   +-- tmcfg.Config from Unmarshal     -- BEFORE app.toml merge
-   +-- appOpts from merged Viper       -- individual Get() calls
+```mermaid
+flowchart TD
+    SEID["seid start"]
+    V1["Viper ReadInConfig(config.toml)"]
+    V2["Viper MergeInConfig(app.toml)<br/><i>SAME Viper instance</i>"]
+    V3["AutomaticEnv — SEID_* overrides"]
+    TM["tmcfg.Config via Unmarshal<br/><i>BEFORE app.toml merge</i>"]
+    APP["appOpts via Get() calls<br/><i>from fully merged Viper</i>"]
+
+    SEID --> V1 --> V2 --> V3
+    V1 --> TM
+    V3 --> APP
 ```
 
 **Critical insight:** sei-config is NOT a dependency of seid. It is a companion library consumed only by the sidecar and controller. The sidecar generates TOML files that seid reads through its standard Viper-based loading. The controller never calls DefaultForMode or ApplyOverrides directly -- it constructs intents and the sidecar resolves them.
@@ -80,62 +74,64 @@ seid startup (reads these files)
 
 A block's journey from proposal through storage, connecting consensus, execution, and storage:
 
-```
-1. PROPOSAL (sei-tendermint)
-   Proposer calls createProposalBlock() -> includes TxKeys (SHA-256 hashes, not full txs)
-   Proposal gossip is near-instant (just hashes + header + commit + evidence)
-   Non-proposers immediately try buildProposalBlock() from local mempool
-   Fallback: traditional block-part gossip if any TxKeys missing from mempool
+```mermaid
+flowchart TD
+    subgraph "1. PROPOSAL — sei-tendermint"
+        P1["createProposalBlock()"] --> P2["TxKeys (SHA-256 hashes, not full txs)"]
+        P2 --> P3["Near-instant gossip: hashes + header + commit"]
+        P3 --> P4["Non-proposers: buildProposalBlock() from local mempool"]
+        P4 --> P5["Fallback: block-part gossip if TxKeys missing"]
+    end
 
-2. PREVOTE/PRECOMMIT (sei-tendermint)
-   Standard Tendermint BFT: 2/3+ prevotes -> 2/3+ precommits -> commit
-   Block parts are 1MB (16x upstream 64KB), WAL messages up to 4MB
+    subgraph "2. CONSENSUS — sei-tendermint"
+        C1["2/3+ prevotes → 2/3+ precommits → commit"]
+        C2["Block parts: 1MB (16x upstream), WAL: 4MB"]
+    end
 
-3. FINALIZE BLOCK (sei-chain/sei-cosmos)
-   App.ProcessBlock():
-     a. BeginBlock (sequential -- module begin-blockers)
-     b. DecodeTransactionsConcurrently (parallel goroutines)
-     c. PartitionPrioritizedTxs (oracle votes, DEX ops go first)
-     d. OCC Batch 1: prioritized txs via Scheduler.ProcessAll()
-        - Worker pool (default min(NumCPU*2, 128) goroutines)
-        - MultiVersionStore per KV store key
-        - Execute all txs concurrently -> validate read-sets -> re-execute conflicts
-        - Max 10 iterations before sequential fallback
-     e. WriteDeferredBalances (flush bank module deferred sends)
-     f. MidBlock (oracle price aggregation)
-     g. OCC Batch 2: remaining txs (same flow)
-     h. WriteDeferredBalances
-     i. EndBlock (sequential -- EVM fee collection, bloom filters)
+    subgraph "3. FINALIZE BLOCK — sei-chain/sei-cosmos"
+        F1["BeginBlock (sequential)"]
+        F2["DecodeTransactionsConcurrently"]
+        F3["PartitionPrioritizedTxs (oracle, DEX first)"]
+        F4["OCC Batch 1: prioritized txs<br/>Workers: min(NumCPU*2, 128)<br/>MultiVersionStore per KV key<br/>Max 10 iterations → sequential fallback"]
+        F5["WriteDeferredBalances"]
+        F6["MidBlock (oracle price aggregation)"]
+        F7["OCC Batch 2: remaining txs"]
+        F8["WriteDeferredBalances"]
+        F9["EndBlock (sequential — EVM fees, bloom)"]
+        F1 --> F2 --> F3 --> F4 --> F5 --> F6 --> F7 --> F8 --> F9
+    end
 
-4. COMMIT (sei-db)
-   ChangeSet (Set/Delete per module) flows to:
-     SC (MemIAVL): Apply changeset to in-memory tree -> append to WAL -> return app hash
-     SS (PebbleDB): Async write via channel -> MVCC-encoded versioned KV pairs
-   SC snapshot every 10,000 blocks (background, COW-based)
+    subgraph "4. COMMIT — sei-db"
+        D1["ChangeSet (Set/Delete per module)"]
+        D2["SC (MemIAVL): apply → WAL append → app hash"]
+        D3["SS (PebbleDB): async write → MVCC KV"]
+        D4["SC snapshot every 10K blocks (background COW)"]
+        D1 --> D2
+        D1 --> D3
+        D2 --> D4
+    end
+
+    P5 --> C1
+    C1 --> F1
+    F9 --> D1
 ```
 
 ## Storage Architecture
 
-```
-                  +--------------------------+
-                  |     Block Execution      |
-                  +-----------+--------------+
-                              |
-                         ChangeSet
-                              |
-              +---------------+---------------+
-              |                               |
-     SC Layer (MemIAVL)              SS Layer (PebbleDB)
-     Purpose: Merkle tree,           Purpose: versioned
-     app hash, ICS23 proofs          historical queries
-              |                               |
-     +--------+--------+           +----------+---------+
-     |        |        |           |          |         |
-   In-mem   WAL    Snapshots    MVCC KV    Pruning   XOR Hash
-   tree    (seq)   (mmap,       (Zstd     (background, (integrity
-   (latest  append) 10K blks)   compressed) configurable) verification)
-     |
-   App Hash (consensus-critical)
+```mermaid
+graph TD
+    BE["Block Execution"] -->|ChangeSet| split{" "}
+    split --> SC["SC Layer — MemIAVL<br/><i>Merkle tree, app hash, ICS23 proofs</i>"]
+    split --> SS["SS Layer — PebbleDB<br/><i>versioned historical queries</i>"]
+
+    SC --> IMT["In-memory tree<br/><i>(latest state)</i>"]
+    SC --> WAL["WAL<br/><i>(sequential append)</i>"]
+    SC --> SNAP["Snapshots<br/><i>(mmap, every 10K blocks)</i>"]
+    IMT --> AH["App Hash<br/><i>(consensus-critical)</i>"]
+
+    SS --> MVCC["MVCC KV<br/><i>(Zstd compressed)</i>"]
+    SS --> PRUNE["Pruning<br/><i>(background, configurable)</i>"]
+    SS --> XOR["XOR Hash<br/><i>(integrity verification)</i>"]
 ```
 
 **SC internals:** MemIAVL keeps the full IAVL tree in memory. PersistedNodes are zero-copy references into mmap'd flat files (48 bytes/node). PersistedNode.Get() uses binary search over sorted leaf arrays -- O(log n) with zero deserialization. Hashing is identical to standard cosmos/iavl (SHA-256), ensuring seamless swap.
@@ -173,32 +169,40 @@ The EVM is a native Cosmos SDK module (`x/evm`), not a sidechain:
 
 ## Operator Control Plane
 
-```
-SeiNodeGroup
-  |
-  +-- reconcileSeiNodes() -- ensure N children exist
-  |     creates SeiNode CRs with mode sub-spec (fullNode/archive/validator/replayer)
-  |
-  +-- reconcilePlan() -- group-level orchestration
-  |     Genesis: assemble-genesis -> collect-and-set-peers -> await-nodes-running
-  |     BlueGreen: create-entrant -> await-running -> await-caught-up -> switch-traffic -> teardown
-  |     HardFork: create-entrant -> await-running -> submit-halt-signal -> await-height -> switch -> teardown
-  |
-  +-- reconcileNetworking() -- Service (SSA), HTTPRoute (Gateway API), AuthorizationPolicy (Istio)
-  +-- reconcileMonitoring() -- ServiceMonitor (Prometheus Operator)
+```mermaid
+graph TD
+    SNG["SeiNodeGroup"]
+    SNG --> rn["reconcileSeiNodes()<br/><i>ensure N children exist</i>"]
+    SNG --> rp["reconcilePlan()<br/><i>group-level orchestration</i>"]
+    SNG --> rnet["reconcileNetworking()<br/><i>Service, HTTPRoute, AuthzPolicy</i>"]
+    SNG --> rmon["reconcileMonitoring()<br/><i>ServiceMonitor</i>"]
 
-SeiNode
-  |
-  +-- Pending -> build plan -> Initializing
-  |     Planner selected by mode: fullNodePlanner, archiveNodePlanner, validatorPlanner, replayerPlanner
-  |
-  +-- Initializing -> drive plan tasks sequentially
-  |     Task IDs: deterministic UUID v5 from planID/taskType/index (idempotent resubmission)
-  |     Each task: Execute (submit) -> poll Status -> Complete/Failed/Retry
-  |     Retry: exponential backoff 5s * 2^min(attempt, 5), max 30s
-  |
-  +-- Running -> reconcile monitor tasks (snapshot-upload, result-export)
-  +-- Failed (terminal)
+    rn -->|creates| SN["SeiNode CRs<br/><i>fullNode / archive / validator / replayer</i>"]
+
+    rp --> gen["Genesis: assemble → collect-peers → await-running"]
+    rp --> bg["BlueGreen: create-entrant → await-caught-up → switch → teardown"]
+    rp --> hf["HardFork: create-entrant → halt-signal → await-height → switch → teardown"]
+```
+
+```mermaid
+stateDiagram-v2
+    [*] --> Pending
+    Pending --> Initializing: build plan (mode-specific planner)
+    Initializing --> Running: all plan tasks complete
+    Initializing --> Failed: unrecoverable error
+
+    state Initializing {
+        [*] --> ExecuteTask
+        ExecuteTask --> PollStatus
+        PollStatus --> ExecuteTask: next task
+        PollStatus --> ExecuteTask: retry (5s × 2^min(attempt,5), max 30s)
+        note right of ExecuteTask: Task IDs = UUID v5(planID, taskType, index)\nIdempotent resubmission
+    }
+
+    state Running {
+        [*] --> MonitorTasks
+        MonitorTasks: snapshot-upload, result-export
+    }
 ```
 
 **Key design:** The controller never writes config files or runs seid commands directly. It submits structured tasks to the sidecar HTTP API at `http://{name}-0.{name}.{namespace}.svc.cluster.local:7777`. The sidecar executes tasks using the same Go SDK functions as `seid init`/`seid gentx`/`seid collect-gentxs` -- in-process, no shell-outs.
@@ -207,55 +211,34 @@ SeiNode
 
 End-to-end for a full node with S3 snapshot, peers, and state sync:
 
-```
-Controller                    Sidecar (:7777)                seid
-    |                              |                           |
-    |  create SeiNode CRD          |                           |
-    |  create PVC                  |                           |
-    |  (Pending -> Initializing)   |                           |
-    |                              |                           |
-    |-- snapshot-restore --------->|                           |
-    |   (S3 download + extract     |                           |
-    |    to data/snapshots/)       |                           |
-    |                              |                           |
-    |-- configure-genesis -------->|                           |
-    |   (embedded for known chains |                           |
-    |    OR s3://{bucket}/{chain}) |                           |
-    |                              |                           |
-    |-- config-apply ------------->|                           |
-    |   (ResolveIntent:            |                           |
-    |    mode=full + overrides     |                           |
-    |    -> config.toml + app.toml)|                           |
-    |                              |                           |
-    |-- discover-peers ----------->|                           |
-    |   (EC2 tags / static /       |                           |
-    |    label -> persistent-peers)|                           |
-    |                              |                           |
-    |-- configure-state-sync ----->|                           |
-    |   (query peer RPC for trust  |                           |
-    |    height-2000, block hash   |                           |
-    |    -> statesync config)      |                           |
-    |                              |                           |
-    |-- config-validate ---------->|                           |
-    |-- mark-ready --------------->| (healthz -> 200)          |
-    |                              |                           |
-    |  create StatefulSet + Service|                           |
-    |                              |     seid-init (checks     |
-    |                              |     genesis.json exists)  |
-    |                              |                           |
-    |                              |     seid start            |
-    |                              |       |                   |
-    |                              |    State Sync:            |
-    |                              |    1. Discover snapshots  |
-    |                              |    2. Fetch+apply chunks  |
-    |                              |       (ABCI OfferSnapshot/|
-    |                              |        ApplySnapshotChunk)|
-    |                              |    3. Backfill headers    |
-    |                              |    4. Block sync from     |
-    |                              |       snapshot_height+1   |
-    |                              |       (FIRST execution)   |
-    |                              |    5. Switch to consensus |
-    |  (Initializing -> Running)   |                           |
+```mermaid
+sequenceDiagram
+    participant C as Controller
+    participant S as Sidecar :7777
+    participant N as seid
+
+    C->>C: create SeiNode CRD + PVC (Pending → Initializing)
+
+    C->>S: snapshot-restore (S3 download + extract)
+    C->>S: configure-genesis (embedded or S3)
+    C->>S: config-apply (ResolveIntent → config.toml + app.toml)
+    C->>S: discover-peers (EC2 tags / static / label)
+    C->>S: configure-state-sync (trust height-2000, block hash)
+    C->>S: config-validate
+    C->>S: mark-ready (healthz → 200)
+
+    C->>C: create StatefulSet + Service
+
+    N->>N: seid-init (check genesis.json)
+    N->>N: seid start
+    Note over N: State Sync
+    N->>N: 1. Discover snapshots
+    N->>N: 2. Fetch + apply chunks
+    N->>N: 3. Backfill headers
+    N->>N: 4. Block sync from snapshot_height+1 (FIRST execution)
+    N->>N: 5. Switch to consensus
+
+    C->>C: Initializing → Running
 ```
 
 **Genesis ceremony variant:** Each validator runs generate-identity -> generate-gentx -> upload-genesis-artifacts to S3. The group assembler collects all gentxs via S3 (calling the same `genutil.GenAppStateFromConfig` as `seid collect-gentxs`), uploads final genesis.json + peers.json. Each node's configure-genesis task retries up to 180 times (30 min) until the assembled genesis is available.
