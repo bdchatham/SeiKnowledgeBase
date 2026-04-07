@@ -11,6 +11,7 @@ memories/
   sei-execution/        # Transaction execution: OCC, Giga, Autobahn, parallelism
   sei-storage/          # SeiDB, MemIAVL, state-commit, state-store, pruning
   sei-evm/              # Parallel EVM, pointer contracts, EVM/Cosmos interop
+  sei-operations/       # Kubernetes operator, seictl CLI, node lifecycle tooling
 ```
 
 Categories are added as research covers new ground. Keep them minimal — one category per coherent domain, not one per subtopic.
