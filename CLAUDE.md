@@ -7,18 +7,47 @@ Structured knowledge base of Sei blockchain internals, built through Tide resear
 ```
 memories/
   node-configuration/   # How Sei nodes are configured and run
+  sei-consensus/        # Tendermint fork, block production, consensus modifications
+  sei-execution/        # Transaction execution: OCC, Giga, Autobahn, parallelism
+  sei-storage/          # SeiDB, MemIAVL, state-commit, state-store, pruning
+  sei-evm/              # Parallel EVM, pointer contracts, EVM/Cosmos interop
 ```
 
 Categories are added as research covers new ground. Keep them minimal — one category per coherent domain, not one per subtopic.
 
 ### node-configuration
 
-Research topics within this category:
+- **Node types** — full node, archive, validator, seed, sentry. Configuration differences.
+- **sei-config package** — the config library internals, loading, validation, ConfigIntent pipeline.
+- **seid configuration consumption** — startup path from `seid start` through Viper to runtime.
+- **State sync** — state sync code path end-to-end, trust parameters, snapshot mechanics.
 
-- **Node types** — full node, archive, validator, seed, sentry. How configurations differ between them and what makes each mode distinct.
-- **sei-config package** — the `sei-config` library itself. How it defines, loads, and exposes configuration to the node binary.
-- **seid configuration consumption** — how `seid` reads config.toml, app.toml, and sei-config values at startup. The chain from config file to runtime behavior.
-- **State sync** — the state sync code path end-to-end, trust parameters, snapshot mechanics.
+### sei-consensus
+
+- **sei-tendermint fork overview** — what Sei changed from upstream CometBFT and why. The delta.
+- **Block production** — proposal, prevote, precommit flow with Sei modifications.
+- **P2P layer** — peer management, gossip, Sei-specific networking changes.
+- **DB sync** — Sei's alternative to state sync for bootstrapping nodes.
+
+### sei-execution
+
+- **OCC (Optimistic Concurrency Control)** — parallel tx execution, conflict detection, abort/retry.
+- **Giga executor** — next-gen execution engine (WIP). Architecture and current state.
+- **Autobahn** — high-throughput pipeline (WIP). Architecture and current state.
+- **Transaction lifecycle** — from mempool through execution to commit.
+
+### sei-storage
+
+- **SeiDB architecture** — state-commit (MemIAVL) vs state-store (PebbleDB), why two layers.
+- **MemIAVL** — Sei's in-memory IAVL fork, how it differs from standard IAVL.
+- **Pruning and compaction** — how state is pruned across both storage layers.
+- **Snapshot mechanics** — how snapshots are created and consumed at the storage level.
+
+### sei-evm
+
+- **Parallel EVM** — how Sei runs EVM transactions in parallel with Cosmos txs.
+- **Pointer contracts** — bridging EVM and Cosmos address spaces.
+- **EVM RPC** — Sei's Ethereum-compatible JSON-RPC layer.
 
 ## Memory Format
 
